@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+checkpoints
 Data
 develop-eggs/
 dist/
@@ -19,6 +20,7 @@ lib/
 lib64/
 parts/
 sdist/
+segmentation_output
 var/
 wheels/
 pip-wheel-metadata/

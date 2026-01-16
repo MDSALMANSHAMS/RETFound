@@ -31,23 +31,35 @@ class OCTDrusenDataset(Dataset):
     def __init__(self, root, transform=None):
         self.image_dir = os.path.join(root, "images")
         self.mask_dir = os.path.join(root, "masks")
-        self.images = sorted(os.listdir(self.image_dir))
         self.transform = transform
 
+        self.samples = []
+        for img_name in sorted(os.listdir(self.image_dir)):
+            stem = os.path.splitext(img_name)[0]
+            mask_name = stem + "_mask.png"
+            mask_path = os.path.join(self.mask_dir, mask_name)
+            if os.path.isfile(mask_path):
+                self.samples.append((img_name, mask_name))
+
+        print(f"Loaded {len(self.samples)} valid samples from {root}")
+
     def __len__(self):
-        return len(self.images)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        img = cv2.imread(os.path.join(self.image_dir, self.images[idx]))
+        img_name, mask_name = self.samples[idx]
+
+        img = cv2.imread(os.path.join(self.image_dir, img_name))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        mask = cv2.imread(os.path.join(self.mask_dir, self.images[idx]), cv2.IMREAD_GRAYSCALE)
+
+        mask = cv2.imread(os.path.join(self.mask_dir, mask_name), cv2.IMREAD_GRAYSCALE)
+        mask = (mask > 0).astype("uint8")
 
         if self.transform:
             aug = self.transform(image=img, mask=mask)
             img, mask = aug["image"], aug["mask"]
 
-        return img, mask.long()
-
+        return img, torch.tensor(mask, dtype=torch.long)
 
 # =========================
 # Main
@@ -72,7 +84,7 @@ def main():
 
     transform = Compose([
         Resize(args.img_size, args.img_size),
-        Normalize((0.485,0.456,0.406), (0.229,0.224,0.225)),
+        Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ToTensorV2()
     ])
 
@@ -84,38 +96,66 @@ def main():
     val_loader   = DataLoader(val_ds, args.batch_size, shuffle=False, num_workers=4)
     test_loader  = DataLoader(test_ds, args.batch_size, shuffle=False, num_workers=4)
 
-    model = RETFoundSegmentation(args.img_size, args.patch_size).to(device)
+    model = RETFoundSegmentation(args.img_size, args.patch_size, num_classes=2, drop_path=args.drop_path).to(device)
 
+    # -------------------------
+    # Load pretrained weights
+    # -------------------------
     if args.finetune:
-        ckpt = hf_hub_download(f"YukunZhou/{args.finetune}", f"{args.finetune}.pth")
-        state = torch.load(ckpt, map_location="cpu")
+        if os.path.isfile(args.finetune):
+            ckpt_path = args.finetune
+        else:
+            ckpt_path = hf_hub_download(
+                repo_id=f"YukunZhou/{args.finetune}",
+                filename="pytorch_model.bin"
+            )
+
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state = state["model"] if "model" in state else state
+
+        for k in ["head.weight", "head.bias"]:
+            if k in state:
+                del state[k]
+
         interpolate_pos_embed(model.encoder, state)
         model.encoder.load_state_dict(state, strict=False)
+        print("Pretrained RETFound weights loaded.")
 
+    # -------------------------
+    # Optimization
+    # -------------------------
     ce_weights = torch.tensor([float(x) for x in args.ce_weight.split(",")]).to(device)
     ce_loss = nn.CrossEntropyLoss(weight=ce_weights)
 
     def loss_fn(out, tgt):
         return combined_loss_fn(out, tgt, ce_loss, args.dice_weight)
 
-    opt = optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
-    best = 1e9
+    print("\n[DEBUG] Starting training loop...\n")
+
+    # -------------------------
+    # Training Loop
+    # -------------------------
+    best = float("inf")
     for e in range(args.epochs):
-        train_loss = train_segmentation(model, train_loader, loss_fn, opt, device)
+        print(f"[DEBUG] Entered epoch {e+1}")
+        train_loss = train_segmentation(model, train_loader, loss_fn, optimizer, device)
         val_loss, P, T = evaluate_segmentation(model, val_loader, loss_fn, device)
         acc, dice, iou = compute_metrics(P, T)
 
-        print(f"Epoch {e+1}: Train={train_loss:.4f} Val={val_loss:.4f} Dice={dice:.4f} IoU={iou:.4f}")
+        print(f"Epoch {e+1}: Train={train_loss:.4f} | Val={val_loss:.4f} | Dice={dice:.4f} | IoU={iou:.4f}")
 
         if val_loss < best:
             best = val_loss
-            torch.save(model.state_dict(), f"{args.output_dir}/best.pth")
+            torch.save(model.state_dict(), os.path.join(args.output_dir, "best.pth"))
 
+    # -------------------------
+    # Final Test
+    # -------------------------
     test_loss, P, T = evaluate_segmentation(model, test_loader, loss_fn, device)
     acc, dice, iou = compute_metrics(P, T)
-    print(f"Test: Loss={test_loss:.4f} Dice={dice:.4f} IoU={iou:.4f}")
+    print(f"Test: Loss={test_loss:.4f} | Dice={dice:.4f} | IoU={iou:.4f}")
 
 
 if __name__ == "__main__":

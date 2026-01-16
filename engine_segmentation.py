@@ -28,13 +28,21 @@ def compute_metrics(preds, targets, smooth=1e-6):
 def train_segmentation(model, loader, loss_fn, optimizer, device):
     model.train()
     total = 0
-    for x, y in loader:
+
+    for step, (x, y) in enumerate(loader):
         x, y = x.to(device), y.to(device)
+
         optimizer.zero_grad()
-        loss = loss_fn(model(x), y)
+        out = model(x)
+        loss = loss_fn(out, y)
         loss.backward()
         optimizer.step()
+
         total += loss.item() * x.size(0)
+
+        if step % 10 == 0:
+            print(f"  [batch {step}/{len(loader)}] loss: {loss.item():.4f}")
+
     return total / len(loader.dataset)
 
 
